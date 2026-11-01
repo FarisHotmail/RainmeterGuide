@@ -1,0 +1,181 @@
+import JSZip from 'jszip';
+import { SkinProject } from '../types/rainmeter';
+import { serializeSkinToIni } from './iniEngine';
+
+export interface RmskinPackageOptions {
+  packageName: string;
+  author: string;
+  version: string;
+  minimumRainmeter: string;
+  minimumWindows: string;
+  loadType: 'Skin' | 'Layout';
+  includeVariablesInc: boolean;
+  includeReadme: boolean;
+}
+
+/**
+ * Generates the official `RMSKIN.ini` manifest located at the root of an `.rmskin` archive.
+ */
+export function buildRmskinManifest(
+  project: SkinProject,
+  options: RmskinPackageOptions
+): string {
+  const safeFolder = project.folderName.replace(/[^A-Za-z0-9_-]/g, '') || 'RainCraftSkin';
+  const safeFile = project.fileName.endsWith('.ini')
+    ? project.fileName
+    : `${project.fileName}.ini`;
+
+  return [
+    '[rmskin]',
+    `Name=${options.packageName || project.metadata.Name}`,
+    `Author=${options.author || project.metadata.Author}`,
+    `Version=${options.version || project.metadata.Version}`,
+    `LoadType=${options.loadType}`,
+    `Load=${safeFolder}\\${safeFile}`,
+    `MinimumRainmeter=${options.minimumRainmeter || '4.5.0'}`,
+    `MinimumWindows=${options.minimumWindows || '10.0'}`,
+    'VariableFiles=',
+    '',
+  ].join('\r\n');
+}
+
+/**
+ * Appends the authentic 16-byte Rainmeter Skin Installer (`SkinInstaller.exe`) binary footer
+ * to a standard ZIP byte array:
+ * - Bytes 0..7: Little-endian unsigned 64-bit integer of the ZIP byte length
+ * - Byte 8: Flags byte (`0x00`)
+ * - Bytes 9..15: ASCII `"RMSKIN\0"` (`52 4D 53 4B 49 4E 00`)
+ */
+export function appendRmskinBinaryFooter(zipBytes: Uint8Array): Uint8Array {
+  const footer = new Uint8Array(16);
+  const view = new DataView(footer.buffer);
+
+  // Write 64-bit little-endian size (split low/high 32-bit for universal safety)
+  const size = zipBytes.byteLength;
+  const low = size >>> 0;
+  const high = Math.floor(size / 0x100000000) >>> 0;
+  view.setUint32(0, low, true);
+  view.setUint32(4, high, true);
+
+  // Byte 8: Flags = 0
+  footer[8] = 0x00;
+
+  // Bytes 9..15: "RMSKIN\0"
+  const magic = [0x52, 0x4d, 0x53, 0x4b, 0x49, 0x4e, 0x00];
+  for (let i = 0; i < magic.length; i++) {
+    footer[9 + i] = magic[i];
+  }
+
+  const output = new Uint8Array(zipBytes.byteLength + 16);
+  output.set(zipBytes, 0);
+  output.set(footer, zipBytes.byteLength);
+  return output;
+}
+
+/**
+ * Generates a 400x60 24-bit uncompressed BMP header banner (`RMSKIN.bmp`) for Rainmeter Installer.
+ */
+export function generateInstallerBmpBanner(): Uint8Array {
+  const width = 400;
+  const height = 60;
+  const rowSize = Math.ceil((width * 3) / 4) * 4;
+  const pixelArraySize = rowSize * height;
+  const fileSize = 54 + pixelArraySize;
+
+  const buf = new Uint8Array(fileSize);
+  const view = new DataView(buf.buffer);
+
+  // BMP File Header (14 bytes)
+  buf[0] = 0x42; // 'B'
+  buf[1] = 0x4d; // 'M'
+  view.setUint32(2, fileSize, true);
+  view.setUint32(10, 54, true);
+
+  // DIB Header BITMAPINFOHEADER (40 bytes)
+  view.setUint32(14, 40, true);
+  view.setInt32(18, width, true);
+  view.setInt32(22, height, true); // bottom-up
+  view.setUint16(26, 1, true); // planes
+  view.setUint16(28, 24, true); // 24-bit RGB
+  view.setUint32(34, pixelArraySize, true);
+
+  // Subtle dark slate gradient with sky-cyan bottom accent line
+  for (let y = 0; y < height; y++) {
+    const rowOffset = 54 + y * rowSize;
+    for (let x = 0; x < width; x++) {
+      const pxOffset = rowOffset + x * 3;
+      if (y < 3) {
+        // Bottom 3px sky-blue accent bar
+        const ratio = x / width;
+        buf[pxOffset + 0] = Math.round(248 - ratio * 60); // B
+        buf[pxOffset + 1] = Math.round(189 - ratio * 40); // G
+        buf[pxOffset + 2] = Math.round(56 + ratio * 30); // R
+      } else {
+        const grad = y / height;
+        buf[pxOffset + 0] = Math.round(38 + grad * 12); // B
+        buf[pxOffset + 1] = Math.round(23 + grad * 10); // G
+        buf[pxOffset + 2] = Math.round(15 + grad * 8); // R
+      }
+    }
+  }
+
+  return buf;
+}
+
+/**
+ * Builds the complete `.rmskin` or `.zip` archive bytes from the current `SkinProject`.
+ */
+export async function buildSkinArchiveBytes(
+  project: SkinProject,
+  options: RmskinPackageOptions,
+  asRmskin = true
+): Promise<Uint8Array> {
+  const zip = new JSZip();
+  const safeFolder = project.folderName.replace(/[^A-Za-z0-9_-]/g, '') || 'RainCraftSkin';
+  const safeFile = project.fileName.endsWith('.ini')
+    ? project.fileName
+    : `${project.fileName}.ini`;
+
+  // 1. RMSKIN.ini & RMSKIN.bmp at archive root
+  zip.file('RMSKIN.ini', buildRmskinManifest(project, options));
+  zip.file('RMSKIN.bmp', generateInstallerBmpBanner());
+
+  // 2. Skins/<FolderName>/<SkinFile>.ini
+  const iniText = serializeSkinToIni(project).replace(/\r?\n/g, '\r\n');
+  zip.file(`Skins/${safeFolder}/${safeFile}`, iniText);
+
+  // 3. Optional @Resources/Variables.inc
+  if (options.includeVariablesInc && project.variables.length > 0) {
+    const varLines = [
+      '; Generated by RainCraft Studio',
+      '[Variables]',
+      ...project.variables.map((v) => `${v.key}=${v.value}`),
+      '',
+    ].join('\r\n');
+    zip.file(`Skins/${safeFolder}/@Resources/Variables.inc`, varLines);
+  }
+
+  // 4. Optional README.txt
+  if (options.includeReadme) {
+    const readme = [
+      `${options.packageName || project.metadata.Name} v${options.version || project.metadata.Version}`,
+      `Yazar: ${options.author || project.metadata.Author}`,
+      `Lisans: ${project.metadata.License}`,
+      '',
+      'Kurulum (Installation):',
+      '1. Rainmeter 4.5 veya üzeri sürümün bilgisayarınızda kurulu olduğundan emin olun.',
+      '2. İndirdiğiniz .rmskin dosyasına çift tıklayın ve "Install" butonuna basın.',
+      `3. Alternatif olarak Skins/${safeFolder} klasörünü Belgeler\\Rainmeter\\Skins dizinine kopyalayın.`,
+      '',
+    ].join('\r\n');
+    zip.file(`Skins/${safeFolder}/README.txt`, readme);
+  }
+
+  const zipBytes = await zip.generateAsync({
+    type: 'uint8array',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 6 },
+  });
+
+  return asRmskin ? appendRmskinBinaryFooter(zipBytes) : zipBytes;
+}

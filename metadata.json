@@ -1,0 +1,6 @@
+{
+  "name": "RainCraft Studio",
+  "description": "Rainmeter temaları ve kabukları için sürükle-bırak görsel tasarım stüdyosu, çift yönlü canlı .ini kod editörü ve .rmskin paketleyici.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
